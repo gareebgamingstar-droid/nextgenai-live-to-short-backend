@@ -1,0 +1,66 @@
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' python-multipart pydantic
+WORKDIR /app
+RUN mkdir -p /app/app && cat > /app/app/main.py <<'PY'
+import os, uuid, subprocess, json, shutil
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+BASE=Path('/tmp/nextgenai'); UPLOADS=BASE/'uploads'; JOBS=BASE/'jobs'; OUTPUTS=BASE/'outputs'
+for p in (UPLOADS,JOBS,OUTPUTS): p.mkdir(parents=True,exist_ok=True)
+app=FastAPI(title='NextGenAI Live to Short API',version='2.0')
+app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
+def run(cmd):
+ p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+ if p.returncode: raise RuntimeError(p.stdout[-5000:])
+ return p.stdout
+def probe(path):
+ out=run(['ffprobe','-v','error','-show_entries','format=duration','-of','json',str(path)])
+ return float(json.loads(out)['format']['duration'])
+def make_clip(src,out,start,duration):
+ vf='scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920'
+ run(['ffmpeg','-y','-ss',str(start),'-i',str(src),'-t',str(duration),'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','128k','-movflags','+faststart',str(out)])
+def windows(src,window=30):
+ dur=probe(src)
+ if dur<=window:return [(0,dur)]
+ count=min(8,max(3,int(dur//90))); step=(dur-window)/(count-1)
+ return [(max(0,i*step),min(window,dur-i*step)) for i in range(count)]
+def process(jid,src):
+ job=JOBS/jid; outdir=OUTPUTS/jid; outdir.mkdir(parents=True,exist_ok=True)
+ try:
+  dur=probe(src); picks=windows(src)[:4]; hs=[]
+  for i,(start,d) in enumerate(picks,1):
+   clip=outdir/f'short_{i}.mp4'; cd=min(60,max(15,d)); make_clip(src,clip,start,cd)
+   hs.append({'id':f'{jid}-{i}','title':f'AI HIGHLIGHT {i}','start':round(start,1),'duration':round(cd,1),'score':max(70,96-i*4),'url':f'/api/jobs/{jid}/files/{clip.name}'})
+   (job/'progress.json').write_text(json.dumps({'status':'rendering','progress':int(i/len(picks)*100),'highlights':hs}))
+  (job/'result.json').write_text(json.dumps({'status':'complete','duration':dur,'highlights':hs}))
+ except Exception as e:(job/'result.json').write_text(json.dumps({'status':'error','error':str(e)}))
+ finally: src.unlink(missing_ok=True)
+@app.get('/api/health')
+def health():return {'ok':True,'service':'NextGenAI Live to Short','ffmpeg':shutil.which('ffmpeg') is not None}
+@app.post('/api/upload')
+async def upload(background_tasks:BackgroundTasks,file:UploadFile=File(...)):
+ ext=Path(file.filename or '').suffix.lower()
+ if ext not in {'.mp4','.mov','.mkv','.webm','.m4v'}:raise HTTPException(400,'Upload MP4/MOV/MKV/WebM/M4V video.')
+ jid=uuid.uuid4().hex; path=UPLOADS/f'{jid}{ext}'
+ with path.open('wb') as f:
+  while chunk:=await file.read(1024*1024):f.write(chunk)
+ (JOBS/jid).mkdir();(JOBS/jid/'progress.json').write_text(json.dumps({'status':'queued','progress':0,'highlights':[]}));background_tasks.add_task(process,jid,path)
+ return {'job_id':jid,'status':'queued'}
+@app.get('/api/jobs/{job_id}')
+def status(job_id):
+ p=JOBS/job_id
+ if not p.exists():raise HTTPException(404,'Job not found')
+ for n in ('result.json','progress.json'):
+  f=p/n
+  if f.exists():return JSONResponse(json.loads(f.read_text()))
+ return {'status':'queued','progress':0,'highlights':[]}
+@app.get('/api/jobs/{job_id}/files/{filename}')
+def file_out(job_id,filename):
+ f=OUTPUTS/job_id/filename
+ if not f.exists():raise HTTPException(404,'File not found')
+ return FileResponse(f,media_type='video/mp4',filename=filename)
+PY
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
